@@ -1,148 +1,211 @@
-#include "esp_camera.h"
-#include <WiFi.h>
 #include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <BH1750.h>
 #include <DHT.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <math.h>
-
-// ===================
-// Select camera model
-// ===================
-#define CAMERA_MODEL_WROVER_KIT // Has PSRAM
-#include "camera_pins.h"
-
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-const char *ssid = "g00pall";
-const char *password = "122140026.1";
 
 // Pin Definitions
 #define DHTPIN 33
 #define MQ135PIN 32
 #define DHTTYPE DHT22
-#define RL 10.0
-#define AIR_R0 3.7
+#define RL 10.0  // Load resistance in kiloohms
+#define AIR_R0 3.7 // R0 value in clean air
+
+// Wi-Fi Credentials
+const char* ssid = "SYIFA";
+const char* password = "24041981";
+
+// API Endpoint
+const char* apiEndpoint = "https://sindanganomfarm.com/api/iot-sensors";
+
+// Farm ID
+const char* farm_id = "9e074c61-46e9-4a6e-8f56-a4563b671387";
 
 // Sensor Initialization
 DHT dht(DHTPIN, DHTTYPE);
+BH1750 lightMeter;
+LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C LCD Address: 0x27 or 0x3F
 
 // Function to convert RS/R0 ratio to ppm for ammonia
 float getPPM(float ratio) {
-  float m = -0.47;
-  float b = 1.58;
+  float m = -0.47; // Slope from datasheet curve
+  float b = 1.58;  // Intercept from datasheet curve
   return pow(10, (m * log10(ratio) + b));
 }
 
-void startCameraServer();
-void setupLedFlash(int pin);
-
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
 
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+  // Initialize I2C for BH1750
+  Wire.begin();
 
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    if (psramFound()) {
-      config.jpeg_quality = 10;
-      config.fb_count = 2;
-      config.grab_mode = CAMERA_GRAB_LATEST;
-    } else {
-      config.frame_size = FRAMESIZE_SVGA;
-      config.fb_location = CAMERA_FB_IN_DRAM;
-    }
-  } else {
-    config.frame_size = FRAMESIZE_240X240;
-#if CONFIG_IDF_TARGET_ESP32S3
-    config.fb_count = 2;
-#endif
-  }
+  // Initialize LCD
+  lcd.begin(16, 2);
+  lcd.backlight();
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
-  }
-
-  Serial.println("Camera initialized.");
-
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-
-  startCameraServer();
-
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  // Display installation message
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Instalasi...");
+  delay(3000);
 
   // Initialize DHT22
   dht.begin();
   Serial.println("DHT22 initialized.");
 
+  // Initialize BH1750
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("BH1750 ready!");
+  } else {
+    Serial.println("Failed to initialize BH1750. Check connections.");
+    while (1);
+  }
+
   // Initialize MQ-135
   pinMode(MQ135PIN, INPUT);
   Serial.println("MQ-135 initialized.");
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected");
+  delay(2000);
 }
 
 void loop() {
-  static unsigned long lastMillis = 0;
+  static unsigned long lastLCDMillis = 0;  // Waktu terakhir pembaruan LCD
+  static unsigned long lastSendMillis = 0; // Waktu terakhir pengiriman data
+  static int cycle = 0;
 
-  if (millis() - lastMillis >= 5000) {
-    lastMillis = millis();
+  // Interval pembaruan LCD (10 detik)
+  if (millis() - lastLCDMillis >= 10000) {
+    lastLCDMillis = millis();
+    cycle = (cycle + 1) % 4; // Cycle antara 0 hingga 3
 
-    // Read DHT22 data
+    // Baca data dari sensor
     float temperature = dht.readTemperature();
     float humidity = dht.readHumidity();
-    if (isnan(temperature) || isnan(humidity)) {
-      Serial.println("Failed to read from DHT sensor!");
-    } else {
-      Serial.println("=====================================");
-      Serial.printf("Temperature: %.2f °C\n", temperature);
-      Serial.printf("Humidity: %.2f%%\n", humidity);
+    float lux = lightMeter.readLightLevel();
+
+    int sensorValue = analogRead(MQ135PIN);
+    float voltage = (sensorValue / 4095.0) * 3.3; // Konversi ke voltase
+    float RS = (3.3 - voltage) * RL / voltage; // Hitung resistansi sensor
+    float ratio = RS / AIR_R0; // Hitung rasio RS/R0
+    float ammoniaPPM = getPPM(ratio); // Konversi ke ppm
+
+    if (isnan(temperature) || isnan(humidity) || lux < 0 || voltage <= 0 || voltage > 3.3) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Sensor Error");
+      return;
     }
 
-    // Read MQ-135 data
+    // Tentukan kondisi
+    String tempCondition = (temperature < 20) ? "Dingin" : 
+                           (temperature > 35) ? "Panas" : "Optimal";
+    String humCondition = (humidity < 30) ? "Kering" : 
+                          (humidity > 80) ? "Lembab" : "Optimal";
+    String lightCondition = (lux <= 6000) ? "Normal" : "Kritis";
+    String ammoniaCondition = (ammoniaPPM <= 25) ? "Normal" : "Kritis";
+
+    // Perbarui LCD
+    
+    lcd.clear();
+    switch (cycle) {
+      case 0:
+        // Siklus 1: Suhu
+        lcd.setCursor(0, 0);
+        lcd.print("Suhu: ");
+        lcd.print(String(temperature, 1) + " C");
+        lcd.setCursor(0, 1);
+        lcd.print("Kondisi: " + tempCondition);
+        break;
+      case 1:
+        // Siklus 2: Kelembapan
+        lcd.setCursor(0, 0);
+        lcd.print("Kelembapan: ");
+        lcd.print(String(humidity, 1) + " %");
+        lcd.setCursor(0, 1);
+        lcd.print("Kondisi: " + humCondition);
+        break;
+      case 2:
+        // Siklus 3: Amonia
+        lcd.setCursor(0, 0);
+        lcd.print("Amonia: ");
+        lcd.print(String(ammoniaPPM, 1) + " ppm");
+        lcd.setCursor(0, 1);
+        lcd.print("Kondisi: " + ammoniaCondition);
+        break;
+      case 3:
+        // Siklus 4: Intensitas Cahaya
+        lcd.setCursor(0, 0);
+        lcd.print("Cahaya: ");
+        lcd.print(String(lux, 1) + " lux");
+        lcd.setCursor(0, 1);
+        lcd.print("Kondisi: " + lightCondition);
+        break;
+    }
+  }
+
+  // Interval pengiriman data ke API (1 jam = 3600000 ms)
+  if (millis() - lastSendMillis >= 3600000) {
+    lastSendMillis = millis();
+
+    // Baca data sensor untuk pengiriman
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    float lux = lightMeter.readLightLevel();
     int sensorValue = analogRead(MQ135PIN);
-    float voltage = (sensorValue / 4095.0) * 3.3;
-    if (voltage > 0 && voltage <= 3.3) {
-      float RS = (3.3 - voltage) * RL / voltage;
-      float ratio = RS / AIR_R0;
-      float ammoniaPPM = getPPM(ratio);
-      Serial.printf("Ammonia Concentration (ppm): %.2f\n", ammoniaPPM);
+    float voltage = (sensorValue / 4095.0) * 3.3; // Konversi ke voltase
+    float RS = (3.3 - voltage) * RL / voltage; // Hitung resistansi sensor
+    float ratio = RS / AIR_R0; // Hitung rasio RS/R0
+    float ammoniaPPM = getPPM(ratio); // Konversi ke ppm
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(apiEndpoint);
+      http.addHeader("Content-Type", "application/json");
+
+      // Siapkan payload JSON
+      String payload = "{";
+      payload += "\"farm_id\": \"" + String(farm_id) + "\",";
+      payload += "\"temperature\": " + String(temperature, 1) + ",";
+      payload += "\"humidity\": " + String(humidity, 1) + ",";
+      payload += "\"ammonia\": " + String(ammoniaPPM, 1) + ",";
+      payload += "\"light_intensity\": " + String(lux, 1);
+      payload += "}";
+
+      int httpResponseCode = http.POST(payload);
+
+      if (httpResponseCode > 0) {
+        Serial.print("Response code: ");
+        Serial.println(httpResponseCode);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Data Sent OK");
+      } else {
+        Serial.print("Error sending POST: ");
+        Serial.println(httpResponseCode);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Send Error");
+      }
+      http.end();
     } else {
-      Serial.println("Invalid voltage. Check sensor and connections!");
+      Serial.println("WiFi disconnected.");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi Error");
     }
   }
 }
